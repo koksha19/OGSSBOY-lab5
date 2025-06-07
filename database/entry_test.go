@@ -7,8 +7,8 @@ import (
 )
 
 func TestEntry_Encode(t *testing.T) {
-	e := entry{"key", "value"}
-	e.Decode(e.Encode())
+	e := Entry{"key", "value"}
+	e.decode(e.encode())
 	if e.key != "key" {
 		t.Error("incorrect key")
 	}
@@ -18,28 +18,13 @@ func TestEntry_Encode(t *testing.T) {
 }
 
 func TestReadValue(t *testing.T) {
-	var (
-		a, b entry
-	)
-	a = entry{"key", "test-value"}
-	originalBytes := a.Encode()
-
-	b.Decode(originalBytes)
-	t.Log("encode/decode", a, b)
-	if a != b {
-		t.Error("Encode/Decode mismatch")
-	}
-
-	b = entry{}
-	n, err := b.DecodeFromReader(bufio.NewReader(bytes.NewReader(originalBytes)))
+	e := Entry{"key", "value"}
+	data := e.encode()
+	v, err := readValue(bufio.NewReader(bytes.NewReader(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log("encode/decodeFromReader", a, b)
-	if a != b {
-		t.Error("Encode/DecodeFromReader mismatch")
-	}
-	if n != len(originalBytes) {
-		t.Errorf("DecodeFromReader() read %d bytes, expected %d", n, len(originalBytes))
+	if v != "value" {
+		t.Errorf("incorrect value [%s]", v)
 	}
 }

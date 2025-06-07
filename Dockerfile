@@ -1,6 +1,6 @@
 FROM golang:1.24 AS build
 
-WORKDIR /go/src/practice-4
+WORKDIR /go/src/practice-5
 COPY . .
 
 RUN go test ./...
@@ -9,9 +9,9 @@ RUN go install ./cmd/...
 
 # ==== Final image ====
 FROM alpine:latest
-WORKDIR /opt/practice-4
-COPY entry.sh /opt/practice-4/
-COPY --from=build /go/bin/* /opt/practice-4
-RUN ls /opt/practice-4
-ENTRYPOINT ["/opt/practice-4/entry.sh"]
+WORKDIR /opt/practice-5
+COPY entry.sh /opt/practice-5/
+COPY --from=build /go/bin/* /opt/practice-5
+RUN ls /opt/practice-5
+ENTRYPOINT ["/opt/practice-5/entry.sh"]
 CMD ["server"]
