@@ -478,5 +478,5 @@ func TestDb_EmptyKeyAndValue(t *testing.T) {
 }
 
 func createTestDatabase(directory string, segmentSize int64) (*Datastore, error) {
-	return createDatabase(directory, segmentSize)
+	return CreateDatabase(directory, segmentSize)
 }

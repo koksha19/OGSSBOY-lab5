@@ -63,7 +63,7 @@ type Segment struct {
 	mu          sync.RWMutex
 }
 
-func createDatabase(directory string, SegmentSize int64) (*Datastore, error) {
+func CreateDatabase(directory string, SegmentSize int64) (*Datastore, error) {
 	if err := os.MkdirAll(directory, defaultFileMode); err != nil {
 		return nil, err
 	}
@@ -367,7 +367,7 @@ func (datastore *Datastore) findKeyLocation(key string) (*Segment, int64, error)
 			return segment, position, nil
 		}
 	}
-	return nil, 0, fmt.Errorf("key not found in datastore")
+	return nil, 0, fmt.Errorf("key not found in db")
 }
 
 func (datastore *Datastore) getKeyPosition(key string) *KeyPosition {
@@ -388,7 +388,7 @@ func (datastore *Datastore) getKeyPosition(key string) *KeyPosition {
 func (datastore *Datastore) Get(key string) (string, error) {
 	location := datastore.getKeyPosition(key)
 	if location == nil {
-		return "", fmt.Errorf("key not found in datastore")
+		return "", fmt.Errorf("key not found in db")
 	}
 
 	value, err := location.segment.readFromSegment(location.position)
@@ -397,7 +397,7 @@ func (datastore *Datastore) Get(key string) (string, error) {
 	}
 
 	if value == tombstoneMarker {
-		return "", fmt.Errorf("key not found in datastore (tombstone)")
+		return "", fmt.Errorf("key not found in db (tombstone)")
 	}
 
 	return value, nil
