@@ -17,11 +17,13 @@ const (
 	minSegments     = 3
 )
 
-type index map[string]int64
+type keyIndex map[string]int64
 
-type KeyPosition struct {
-	segment  *Segment
+type IndexOperation struct {
+	isWrite  bool
+	key      string
 	position int64
+	response chan *KeyPosition
 }
 
 type WriteOperation struct {
@@ -29,10 +31,9 @@ type WriteOperation struct {
 	response chan error
 }
 
-type Operation struct {
-	isWriteable bool
-	key         string
-	position    int64
+type KeyPosition struct {
+	segment  *Segment
+	position int64
 }
 
 type Datastore struct {
@@ -42,31 +43,35 @@ type Datastore struct {
 	directory       string
 	maxSegmentSize  int64
 	segmentCounter  int
-	indexOperations chan Operation
-	keyLocations    chan *KeyPosition
+	indexOperations chan IndexOperation
 	writeOperations chan WriteOperation
-	writeComplete   chan error
-	keyIndex        index
 	segments        []*Segment
 	fileLock        sync.Mutex
-	indexLock       sync.Mutex
+	segmentLock     sync.RWMutex
+	closed          bool
+	closeMutex      sync.Mutex
+	indexWG         sync.WaitGroup
+	writeWG         sync.WaitGroup
 }
 
 type Segment struct {
-	path   string
-	offset int64
-	index  index
+	startOffset int64
+	keyIndex    keyIndex
+	path        string
+	mu          sync.RWMutex
 }
 
-func createDatabase(directory string, segmentSize int64) (*Datastore, error) {
+func createDatabase(directory string, SegmentSize int64) (*Datastore, error) {
+	if err := os.MkdirAll(directory, defaultFileMode); err != nil {
+		return nil, err
+	}
+
 	database := &Datastore{
 		segments:        make([]*Segment, 0),
 		directory:       directory,
-		maxSegmentSize:  segmentSize,
-		indexOperations: make(chan Operation),
-		keyLocations:    make(chan *KeyPosition),
-		writeOperations: make(chan WriteOperation),
-		writeComplete:   make(chan error),
+		maxSegmentSize:  SegmentSize,
+		indexOperations: make(chan IndexOperation, 100),
+		writeOperations: make(chan WriteOperation, 100),
 	}
 
 	if err := database.setNewSegment(); err != nil {
@@ -84,6 +89,20 @@ func createDatabase(directory string, segmentSize int64) (*Datastore, error) {
 }
 
 func (datastore *Datastore) close() error {
+	datastore.closeMutex.Lock()
+	defer datastore.closeMutex.Unlock()
+
+	if datastore.closed {
+		return nil
+	}
+
+	datastore.closed = true
+	close(datastore.indexOperations)
+	close(datastore.writeOperations)
+
+	datastore.indexWG.Wait()
+	datastore.writeWG.Wait()
+
 	if datastore.activeFile != nil {
 		return datastore.activeFile.Close()
 	}
@@ -91,30 +110,32 @@ func (datastore *Datastore) close() error {
 }
 
 func (datastore *Datastore) startIndexHandler() {
+	datastore.indexWG.Add(1)
 	go func() {
+		defer datastore.indexWG.Done()
 		for operation := range datastore.indexOperations {
-			datastore.indexLock.Lock()
-			if operation.isWriteable {
+			if operation.isWrite {
 				datastore.updateIndex(operation.key, operation.position)
 			} else {
 				segment, pos, err := datastore.findKeyLocation(operation.key)
 				if err != nil {
-					datastore.keyLocations <- nil
+					operation.response <- nil
 				} else {
-					datastore.keyLocations <- &KeyPosition{segment, pos}
+					operation.response <- &KeyPosition{segment, pos}
 				}
 			}
-			datastore.indexLock.Unlock()
 		}
 	}()
 }
 
 func (datastore *Datastore) startWriteHandler() {
+	datastore.writeWG.Add(1)
 	go func() {
+		defer datastore.writeWG.Done()
 		for operation := range datastore.writeOperations {
 			datastore.fileLock.Lock()
-			entrySize := operation.data.getLength()
 
+			entrySize := operation.data.getLength()
 			fileInfo, err := datastore.activeFile.Stat()
 			if err != nil {
 				operation.response <- err
@@ -130,14 +151,13 @@ func (datastore *Datastore) startWriteHandler() {
 				}
 			}
 
+			currentPos := datastore.currentOffset
 			bytesWritten, err := datastore.activeFile.Write(operation.data.encode())
 			if err == nil {
-				datastore.indexOperations <- Operation{
-					isWriteable: true,
-					key:         operation.data.key,
-					position:    int64(bytesWritten),
-				}
+				datastore.currentOffset += int64(bytesWritten)
+				datastore.updateIndex(operation.data.key, currentPos)
 			}
+
 			operation.response <- err
 			datastore.fileLock.Unlock()
 		}
@@ -152,17 +172,24 @@ func (datastore *Datastore) setNewSegment() error {
 	}
 
 	segment := &Segment{
-		path:  newFilePath,
-		index: make(index),
+		path:     newFilePath,
+		keyIndex: make(keyIndex),
+	}
+
+	if datastore.activeFile != nil {
+		datastore.activeFile.Close()
 	}
 
 	datastore.activeFile = file
 	datastore.currentOffset = 0
 	datastore.activeFilePath = newFilePath
+
+	datastore.segmentLock.Lock()
 	datastore.segments = append(datastore.segments, segment)
+	datastore.segmentLock.Unlock()
 
 	if len(datastore.segments) >= minSegments {
-		datastore.compactOldSegments()
+		go datastore.compactOldSegments()
 	}
 
 	return nil
@@ -175,31 +202,39 @@ func (datastore *Datastore) generateFileName() string {
 }
 
 func (datastore *Datastore) compactOldSegments() {
-	go func() {
-		compactedFilePath := datastore.generateFileName()
-		compactedSegment := &Segment{
-			path:  compactedFilePath,
-			index: make(index),
-		}
+	datastore.segmentLock.Lock()
+	defer datastore.segmentLock.Unlock()
 
-		var writeOffset int64
-		compactedFile, err := os.OpenFile(compactedFilePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, defaultFileMode)
-		if err != nil {
-			return
-		}
-		defer compactedFile.Close()
+	if len(datastore.segments) < minSegments {
+		return
+	}
 
-		lastIndex := len(datastore.segments) - 2
-		for i := 0; i <= lastIndex; i++ {
-			currentSegment := datastore.segments[i]
-			for key, position := range currentSegment.index {
-				if i < lastIndex {
-					if datastore.keyExistsInNewerSegments(datastore.segments[i+1:lastIndex+1], key) {
-						continue
-					}
+	compactedFilePath := datastore.generateFileName()
+	compactedFile, err := os.OpenFile(compactedFilePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, defaultFileMode)
+	if err != nil {
+		return
+	}
+	defer compactedFile.Close()
+
+	compactedSegment := &Segment{
+		path:     compactedFilePath,
+		keyIndex: make(keyIndex),
+	}
+
+	var writeOffset int64
+	keysWritten := make(map[string]bool)
+
+	for i := len(datastore.segments) - 2; i >= 0; i-- {
+		segment := datastore.segments[i]
+		segment.mu.RLock()
+
+		for key, position := range segment.keyIndex {
+			if !keysWritten[key] {
+				value, err := segment.readFromSegment(position)
+				if err != nil {
+					continue
 				}
 
-				value, _ := currentSegment.readFromSegment(position)
 				record := Entry{
 					key:   key,
 					value: value,
@@ -207,27 +242,29 @@ func (datastore *Datastore) compactOldSegments() {
 
 				bytesWritten, err := compactedFile.Write(record.encode())
 				if err == nil {
-					compactedSegment.index[key] = writeOffset
+					compactedSegment.keyIndex[key] = writeOffset
 					writeOffset += int64(bytesWritten)
+					keysWritten[key] = true
 				}
 			}
 		}
-		datastore.segments = []*Segment{compactedSegment, datastore.getCurrentSegment()}
-	}()
-}
-
-func (datastore *Datastore) keyExistsInNewerSegments(segments []*Segment, key string) bool {
-	for _, segment := range segments {
-		if _, exists := segment.index[key]; exists {
-			return true
-		}
+		segment.mu.RUnlock()
 	}
-	return false
+
+	newSegments := []*Segment{compactedSegment, datastore.segments[len(datastore.segments)-1]}
+	for i := 0; i < len(datastore.segments)-1; i++ {
+		os.Remove(datastore.segments[i].path)
+	}
+
+	datastore.segments = newSegments
 }
 
 func (datastore *Datastore) recoverAllSegments() error {
+	datastore.segmentLock.RLock()
+	defer datastore.segmentLock.RUnlock()
+
 	for _, segment := range datastore.segments {
-		if err := datastore.recoverSegmentData(segment); err != nil {
+		if err := datastore.recoverSegmentData(segment); err != nil && err != io.EOF {
 			return err
 		}
 	}
@@ -247,6 +284,7 @@ func (datastore *Datastore) recoverSegmentData(segment *Segment) error {
 func (datastore *Datastore) processRecovery(file *os.File, segment *Segment) error {
 	var err error
 	var buffer [bufferSize]byte
+	var currentOffset int64
 
 	reader := bufio.NewReaderSize(file, bufferSize)
 	for err == nil {
@@ -262,7 +300,14 @@ func (datastore *Datastore) processRecovery(file *os.File, segment *Segment) err
 			return err
 		}
 
+		if len(header) < 4 {
+			return io.EOF
+		}
+
 		recordSize := binary.LittleEndian.Uint32(header)
+		if recordSize == 0 || recordSize > uint32(bufferSize*10) {
+			return fmt.Errorf("invalid record size: %d", recordSize)
+		}
 
 		if recordSize < bufferSize {
 			data = buffer[:recordSize]
@@ -273,26 +318,45 @@ func (datastore *Datastore) processRecovery(file *os.File, segment *Segment) err
 		bytesRead, err = reader.Read(data)
 		if err == nil {
 			if bytesRead != int(recordSize) {
-				return fmt.Errorf("data corruption detected")
+				return fmt.Errorf("data corruption detected: expected %d bytes, got %d", recordSize, bytesRead)
 			}
 
 			var record Entry
 			record.decode(data)
-			datastore.updateIndex(record.key, int64(bytesRead))
+
+			segment.mu.Lock()
+			segment.keyIndex[record.key] = currentOffset
+			segment.mu.Unlock()
+
+			currentOffset += int64(bytesRead)
 		}
 	}
+
+	if segment == datastore.getCurrentSegment() {
+		datastore.currentOffset = currentOffset
+	}
+
 	return err
 }
 
 func (datastore *Datastore) updateIndex(key string, position int64) {
-	datastore.getCurrentSegment().index[key] = datastore.currentOffset
-	datastore.currentOffset += position
+	currentSegment := datastore.getCurrentSegment()
+	currentSegment.mu.Lock()
+	currentSegment.keyIndex[key] = position
+	currentSegment.mu.Unlock()
 }
 
 func (datastore *Datastore) findKeyLocation(key string) (*Segment, int64, error) {
+	datastore.segmentLock.RLock()
+	defer datastore.segmentLock.RUnlock()
+
 	for i := len(datastore.segments) - 1; i >= 0; i-- {
 		segment := datastore.segments[i]
-		if position, found := segment.index[key]; found {
+		segment.mu.RLock()
+		position, found := segment.keyIndex[key]
+		segment.mu.RUnlock()
+
+		if found {
 			return segment, position, nil
 		}
 	}
@@ -300,12 +364,18 @@ func (datastore *Datastore) findKeyLocation(key string) (*Segment, int64, error)
 }
 
 func (datastore *Datastore) getKeyPosition(key string) *KeyPosition {
-	operation := Operation{
-		isWriteable: false,
-		key:         key,
+	datastore.closeMutex.Lock()
+	defer datastore.closeMutex.Unlock()
+
+	if datastore.closed {
+		return nil
 	}
-	datastore.indexOperations <- operation
-	return <-datastore.keyLocations
+
+	segment, pos, err := datastore.findKeyLocation(key)
+	if err != nil {
+		return nil
+	}
+	return &KeyPosition{segment, pos}
 }
 
 func (datastore *Datastore) Get(key string) (string, error) {
@@ -322,8 +392,15 @@ func (datastore *Datastore) Get(key string) (string, error) {
 }
 
 func (datastore *Datastore) Put(key, value string) error {
-	responseChannel := make(chan error)
-	datastore.writeOperations <- WriteOperation{
+	datastore.closeMutex.Lock()
+	defer datastore.closeMutex.Unlock()
+
+	if datastore.closed {
+		return fmt.Errorf("database is closed")
+	}
+
+	responseChannel := make(chan error, 1)
+	operation := WriteOperation{
 		data: Entry{
 			key:   key,
 			value: value,
@@ -331,12 +408,17 @@ func (datastore *Datastore) Put(key, value string) error {
 		response: responseChannel,
 	}
 
-	err := <-responseChannel
-	close(responseChannel)
-	return err
+	datastore.writeOperations <- operation
+	return <-responseChannel
 }
 
 func (datastore *Datastore) getCurrentSegment() *Segment {
+	datastore.segmentLock.RLock()
+	defer datastore.segmentLock.RUnlock()
+
+	if len(datastore.segments) == 0 {
+		return nil
+	}
 	return datastore.segments[len(datastore.segments)-1]
 }
 
