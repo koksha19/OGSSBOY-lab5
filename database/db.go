@@ -17,6 +17,8 @@ const (
 	minSegments     = 3
 )
 
+const tombstoneMarker = "__deleted__"
+
 type keyIndex map[string]int64
 
 type IndexOperation struct {
@@ -231,7 +233,7 @@ func (datastore *Datastore) compactOldSegments() {
 		for key, position := range segment.keyIndex {
 			if !keysWritten[key] {
 				value, err := segment.readFromSegment(position)
-				if err != nil {
+				if err != nil || value == tombstoneMarker {
 					continue
 				}
 
@@ -342,8 +344,13 @@ func (datastore *Datastore) processRecovery(file *os.File, segment *Segment) err
 func (datastore *Datastore) updateIndex(key string, position int64) {
 	currentSegment := datastore.getCurrentSegment()
 	currentSegment.mu.Lock()
-	currentSegment.keyIndex[key] = position
-	currentSegment.mu.Unlock()
+	defer currentSegment.mu.Unlock()
+
+	if position == -1 {
+		delete(currentSegment.keyIndex, key)
+	} else {
+		currentSegment.keyIndex[key] = position
+	}
 }
 
 func (datastore *Datastore) findKeyLocation(key string) (*Segment, int64, error) {
@@ -388,6 +395,11 @@ func (datastore *Datastore) Get(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	if value == tombstoneMarker {
+		return "", fmt.Errorf("key not found in datastore (tombstone)")
+	}
+
 	return value, nil
 }
 
@@ -409,6 +421,36 @@ func (datastore *Datastore) Put(key, value string) error {
 	}
 
 	datastore.writeOperations <- operation
+	return <-responseChannel
+}
+
+func (datastore *Datastore) Delete(key string) error {
+	datastore.closeMutex.Lock()
+	defer datastore.closeMutex.Unlock()
+
+	if datastore.closed {
+		return fmt.Errorf("database is closed")
+	}
+
+	responseChannel := make(chan error, 1)
+
+	deleteOp := WriteOperation{
+		data: Entry{
+			key:   key,
+			value: tombstoneMarker,
+		},
+		response: responseChannel,
+	}
+
+	datastore.writeOperations <- deleteOp
+
+	datastore.indexOperations <- IndexOperation{
+		isWrite:  true,
+		key:      key,
+		position: -1,
+		response: make(chan *KeyPosition, 1),
+	}
+
 	return <-responseChannel
 }
 

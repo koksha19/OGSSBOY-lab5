@@ -356,10 +356,127 @@ func TestDb_ParallelOperations(t *testing.T) {
 	})
 }
 
-func createTestDatabase(directory string, segmentSize int64) (*Datastore, error) {
-	return createDatabase(directory, segmentSize)
+func TestDb_Delete(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "delete_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	db, err := createTestDatabase(tempDir, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.close()
+
+	err = db.Put("delete_key", "some_value")
+	if err != nil {
+		t.Fatalf("Failed to put key: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	err = db.Delete("delete_key")
+	if err != nil {
+		t.Fatalf("Failed to delete key: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	_, err = db.Get("delete_key")
+	if err == nil {
+		t.Errorf("Expected error retrieving deleted key, but got none")
+	}
 }
 
-func newDb(directory string, segmentSize int64) (*Datastore, error) {
-	return createTestDatabase(directory, segmentSize)
+func TestDb_OverwriteKey(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "overwrite_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	db, err := createTestDatabase(tempDir, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.close()
+
+	key := "dup_key"
+
+	err = db.Put(key, "initial_value")
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	err = db.Put(key, "updated_value")
+	if err != nil {
+		t.Fatalf("Second put failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	val, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if val != "updated_value" {
+		t.Errorf("Expected updated_value, got %s", val)
+	}
+}
+
+func TestDb_NonExistentKey(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "nonexistent_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	db, err := createTestDatabase(tempDir, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.close()
+
+	_, err = db.Get("ghost_key")
+	if err == nil {
+		t.Errorf("Expected error retrieving nonexistent key, but got none")
+	}
+}
+
+func TestDb_EmptyKeyAndValue(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "empty_key_value_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	db, err := createTestDatabase(tempDir, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.close()
+
+	err = db.Put("", "")
+	if err != nil {
+		t.Errorf("Failed to put empty key and value: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	value, err := db.Get("")
+	if err != nil {
+		t.Errorf("Failed to get empty key: %v", err)
+	}
+
+	if value != "" {
+		t.Errorf("Expected empty value, got %s", value)
+	}
+}
+
+func createTestDatabase(directory string, segmentSize int64) (*Datastore, error) {
+	return createDatabase(directory, segmentSize)
 }
